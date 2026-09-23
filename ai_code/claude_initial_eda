@@ -1,0 +1,567 @@
+/*
+
+  Profiling and data-quality checks on de_raw, run before any modelling.
+  Every numbered block is independent: highlight one and run it on its own.
+
+  A  Shape            what's there, how big, what period
+  B  Integrity        scorecards; anything not prefixed info_ should be 0
+  C  Semantics        what the columns actually mean (drives the design)
+  D  Scoring inputs   what the numbers we're about to score look like
+
+  Each result goes into analysis/eda_findings.md as: block, result, so what.
+  B-block checks that fail become cleaning rules in staging or permanent
+  assertions in tests/.
+*/
+
+
+-- =============================================================================
+-- A. SHAPE
+-- =============================================================================
+
+-- A1. Column types, and whether raw tables are partitioned or clustered.
+--     If responses isn't partitioned on answered_at, an incremental model still
+--     scans the whole table every run. Worth knowing before designing one.
+SELECT
+  table_name,
+  ordinal_position,
+  column_name,
+  data_type,
+  is_nullable,
+  is_partitioning_column,
+  clustering_ordinal_position
+FROM `atom-analytics-candidates.de_raw.INFORMATION_SCHEMA.COLUMNS`
+ORDER BY table_name, ordinal_position;
+
+
+-- A2. Volumes and time coverage.
+SELECT 'pupils' AS table_name, COUNT(*) AS n_rows,
+       CAST(NULL AS TIMESTAMP) AS min_ts, CAST(NULL AS TIMESTAMP) AS max_ts
+FROM `atom-analytics-candidates.de_raw.pupils`
+UNION ALL
+SELECT 'assessment_sittings', COUNT(*), MIN(started_at), MAX(COALESCE(finished_at, started_at))
+FROM `atom-analytics-candidates.de_raw.assessment_sittings`
+UNION ALL
+SELECT 'responses', COUNT(*), MIN(answered_at), MAX(answered_at)
+FROM `atom-analytics-candidates.de_raw.responses`
+UNION ALL
+SELECT 'course_hierarchy', COUNT(*), NULL, NULL
+FROM `atom-analytics-candidates.de_raw.course_hierarchy`;
+
+
+-- A3. Activity by month and session type. Tells us whether a rolling 12-month
+--     evidence window means anything on this data, and whether academic years
+--     (Sep-Aug) are split.
+SELECT
+  DATE_TRUNC(DATE(answered_at, 'Europe/London'), MONTH) AS month,
+  session_type,
+  COUNT(*)                   AS n_responses,
+  COUNT(DISTINCT session_id) AS n_sessions,
+  COUNT(DISTINCT pupil_id)   AS n_pupils
+FROM `atom-analytics-candidates.de_raw.responses`
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+-- =============================================================================
+-- B. INTEGRITY
+-- =============================================================================
+
+-- B1. Row-level scorecard. One scan per table, unpivoted to (table, check, n).
+SELECT 'pupils' AS table_name, check_name, n
+FROM (
+  SELECT
+    COUNT(*)                                   AS info_rows,
+    COUNT(pupil_id) - COUNT(DISTINCT pupil_id) AS duplicate_pupil_id,
+    COUNTIF(pupil_id IS NULL)                  AS null_pupil_id,
+    COUNTIF(is_deleted IS NULL)                AS null_is_deleted,
+    COUNTIF(is_deleted)                        AS info_deleted
+  FROM `atom-analytics-candidates.de_raw.pupils`
+)
+UNPIVOT (n FOR check_name IN (
+  info_rows, duplicate_pupil_id, null_pupil_id, null_is_deleted, info_deleted
+))
+
+UNION ALL
+
+SELECT 'assessment_sittings', check_name, n
+FROM (
+  SELECT
+    COUNT(*)                                                       AS info_rows,
+    COUNT(session_id) - COUNT(DISTINCT session_id)                 AS duplicate_session_id,
+    COUNTIF(session_id IS NULL OR pupil_id IS NULL
+            OR assessment_id IS NULL)                              AS null_key,
+    COUNTIF(is_complete IS NULL OR is_deleted IS NULL)             AS null_flag,
+    COUNTIF(started_at IS NULL)                                    AS null_started_at,
+    COUNTIF(is_complete AND finished_at IS NULL)                   AS complete_without_finished_at,
+    COUNTIF(NOT is_complete AND finished_at IS NOT NULL)           AS incomplete_with_finished_at,
+    COUNTIF(finished_at < started_at)                              AS finished_before_started,
+    COUNTIF(TIMESTAMP_DIFF(finished_at, started_at, MINUTE) > 180) AS longer_than_3h,
+    COUNTIF(started_at > CURRENT_TIMESTAMP())                      AS started_in_future,
+    COUNTIF(year_group_at_sitting IS NULL)                         AS null_year_group,
+    COUNTIF(year_group_at_sitting NOT BETWEEN 1 AND 6)             AS year_group_outside_y1_y6,
+    COUNTIF(total_questions IS NULL OR total_questions <= 0)       AS bad_total_questions,
+    COUNTIF(NOT is_complete)                                       AS info_incomplete,
+    COUNTIF(is_deleted)                                            AS info_deleted
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings`
+)
+UNPIVOT (n FOR check_name IN (
+  info_rows, duplicate_session_id, null_key, null_flag, null_started_at,
+  complete_without_finished_at, incomplete_with_finished_at, finished_before_started,
+  longer_than_3h, started_in_future, null_year_group, year_group_outside_y1_y6,
+  bad_total_questions, info_incomplete, info_deleted
+))
+
+UNION ALL
+
+SELECT 'responses', check_name, n
+FROM (
+  SELECT
+    COUNT(*)                                                 AS info_rows,
+    COUNT(response_id) - COUNT(DISTINCT response_id)         AS duplicate_response_id,
+    COUNTIF(response_id IS NULL OR pupil_id IS NULL
+            OR session_id IS NULL OR question_id IS NULL)    AS null_key,
+    COUNTIF(is_correct IS NULL)                              AS null_is_correct,
+    COUNTIF(is_no_attempt IS NULL)                           AS null_is_no_attempt,
+    COUNTIF(is_correct AND is_no_attempt)                    AS correct_but_no_attempt,
+    COUNTIF(answered_at IS NULL)                             AS null_answered_at,
+    COUNTIF(answered_at > CURRENT_TIMESTAMP())               AS answered_in_future,
+    COUNTIF(seconds_taken IS NULL)                           AS null_seconds_taken,
+    COUNTIF(seconds_taken < 0)                               AS negative_seconds_taken,
+    COUNTIF(seconds_taken > 3600)                            AS over_1h_on_one_question,
+    COUNTIF(question_number IS NULL OR question_number < 1)  AS bad_question_number,
+    COUNTIF(is_no_attempt)                                   AS info_no_attempt,
+    COUNTIF(seconds_taken <= 2 AND NOT is_no_attempt)        AS info_answered_in_2s_or_less
+  FROM `atom-analytics-candidates.de_raw.responses`
+)
+UNPIVOT (n FOR check_name IN (
+  info_rows, duplicate_response_id, null_key, null_is_correct, null_is_no_attempt,
+  correct_but_no_attempt, null_answered_at, answered_in_future, null_seconds_taken,
+  negative_seconds_taken, over_1h_on_one_question, bad_question_number,
+  info_no_attempt, info_answered_in_2s_or_less
+))
+
+UNION ALL
+
+SELECT 'course_hierarchy', check_name, n
+FROM (
+  SELECT
+    COUNT(*)                                             AS info_rows,
+    COUNT(question_id) - COUNT(DISTINCT question_id)     AS duplicate_question_id,
+    COUNTIF(question_id IS NULL)                         AS null_question_id,
+    COUNTIF(atom_id IS NULL OR subtopic_id IS NULL
+            OR topic_id IS NULL OR subject_id IS NULL)   AS null_hierarchy_level,
+    COUNTIF(subject_name IS NULL OR TRIM(subject_name) = '') AS null_subject_name,
+    COUNTIF(subject_name != TRIM(subject_name))          AS untrimmed_subject_name
+  FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+)
+UNPIVOT (n FOR check_name IN (
+  info_rows, duplicate_question_id, null_question_id, null_hierarchy_level,
+  null_subject_name, untrimmed_subject_name
+))
+ORDER BY table_name, check_name;
+
+
+-- B2. Grain checks that need a GROUP BY.
+--     n_keys = keys breaking the expected grain, max_n = the worst case.
+--     The hierarchy rows matter most: a question in two subtopics would
+--     silently double-count every response to it on the join.
+SELECT 'responses: (session_id, question_id) repeats' AS check_name,
+       COUNT(*) AS n_keys, MAX(n) AS max_n
+FROM (SELECT session_id, question_id, COUNT(*) AS n
+      FROM `atom-analytics-candidates.de_raw.responses`
+      GROUP BY 1, 2 HAVING n > 1)
+UNION ALL
+SELECT 'responses: (session_id, question_number) repeats', COUNT(*), MAX(n)
+FROM (SELECT session_id, question_number, COUNT(*) AS n
+      FROM `atom-analytics-candidates.de_raw.responses`
+      GROUP BY 1, 2 HAVING n > 1)
+UNION ALL
+-- Same answer at the same instant under two response_ids = pipeline duplicate,
+-- not a pupil changing their answer. Separates the two cases above.
+SELECT 'responses: identical event, different response_id', COUNT(*), MAX(n)
+FROM (SELECT session_id, question_id, is_correct, answered_at, COUNT(*) AS n
+      FROM `atom-analytics-candidates.de_raw.responses`
+      GROUP BY 1, 2, 3, 4 HAVING n > 1)
+UNION ALL
+SELECT 'hierarchy: atom in >1 subtopic', COUNT(*), MAX(n)
+FROM (SELECT atom_id, COUNT(DISTINCT subtopic_id) AS n
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+      GROUP BY 1 HAVING n > 1)
+UNION ALL
+SELECT 'hierarchy: subtopic in >1 topic', COUNT(*), MAX(n)
+FROM (SELECT subtopic_id, COUNT(DISTINCT topic_id) AS n
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+      GROUP BY 1 HAVING n > 1)
+UNION ALL
+SELECT 'hierarchy: topic in >1 subject', COUNT(*), MAX(n)
+FROM (SELECT topic_id, COUNT(DISTINCT subject_id) AS n
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+      GROUP BY 1 HAVING n > 1)
+UNION ALL
+SELECT 'hierarchy: subject_id with >1 name', COUNT(*), MAX(n)
+FROM (SELECT subject_id, COUNT(DISTINCT subject_name) AS n
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+      GROUP BY 1 HAVING n > 1)
+UNION ALL
+SELECT 'hierarchy: subject_name with >1 id', COUNT(*), MAX(n)
+FROM (SELECT LOWER(TRIM(subject_name)) AS subject_name, COUNT(DISTINCT subject_id) AS n
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+      GROUP BY 1 HAVING n > 1);
+
+
+-- B3. Responses against their parents. One pass over responses.
+--     Parents are de-duplicated first so a bad parent can't fan out the counts.
+WITH
+sittings AS (
+  SELECT session_id, pupil_id, started_at, finished_at, is_deleted
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY started_at) = 1
+),
+questions AS (
+  SELECT DISTINCT question_id
+  FROM `atom-analytics-candidates.de_raw.course_hierarchy`
+),
+pupils AS (
+  SELECT pupil_id, LOGICAL_OR(is_deleted) AS is_deleted
+  FROM `atom-analytics-candidates.de_raw.pupils`
+  GROUP BY 1
+)
+SELECT check_name, n
+FROM (
+  SELECT
+    COUNT(*)                                                    AS info_responses,
+    COUNTIF(s.session_id IS NULL)                               AS response_without_sitting,
+    COUNTIF(q.question_id IS NULL)                              AS response_without_hierarchy,
+    COUNTIF(p.pupil_id IS NULL)                                 AS response_without_pupil,
+    COUNTIF(r.pupil_id != s.pupil_id)                           AS pupil_differs_from_sitting,
+    COUNTIF(r.answered_at < TIMESTAMP_SUB(s.started_at, INTERVAL 1 MINUTE))
+                                                                AS answered_before_sitting_start,
+    COUNTIF(r.answered_at > TIMESTAMP_ADD(s.finished_at, INTERVAL 1 MINUTE))
+                                                                AS answered_after_sitting_finish,
+    COUNTIF(s.is_deleted)                                       AS info_on_deleted_sitting,
+    COUNTIF(p.is_deleted)                                       AS info_for_deleted_pupil
+  FROM `atom-analytics-candidates.de_raw.responses` AS r
+  LEFT JOIN sittings  AS s ON s.session_id  = r.session_id
+  LEFT JOIN questions AS q ON q.question_id = r.question_id
+  LEFT JOIN pupils    AS p ON p.pupil_id    = r.pupil_id
+)
+UNPIVOT (n FOR check_name IN (
+  info_responses, response_without_sitting, response_without_hierarchy,
+  response_without_pupil, pupil_differs_from_sitting, answered_before_sitting_start,
+  answered_after_sitting_finish, info_on_deleted_sitting, info_for_deleted_pupil
+));
+
+
+-- B4. Sittings against their responses and pupils.
+--     "complete but fewer responses than total_questions" decides the denominator:
+--     missing questions can't be attributed to a subject (no question_id).
+WITH
+responses_per_session AS (
+  SELECT
+    session_id,
+    COUNT(*)                    AS n_responses,
+    COUNT(DISTINCT question_id) AS n_distinct_questions,
+    MAX(question_number)        AS max_question_number
+  FROM `atom-analytics-candidates.de_raw.responses`
+  GROUP BY 1
+),
+pupils AS (
+  SELECT pupil_id, LOGICAL_OR(is_deleted) AS is_deleted
+  FROM `atom-analytics-candidates.de_raw.pupils`
+  GROUP BY 1
+)
+SELECT check_name, n
+FROM (
+  SELECT
+    COUNT(*)                                                     AS info_sittings,
+    COUNTIF(p.pupil_id IS NULL)                                  AS sitting_without_pupil,
+    COUNTIF(p.is_deleted AND NOT s.is_deleted)                   AS live_sitting_for_deleted_pupil,
+    COUNTIF(r.session_id IS NULL AND s.is_complete)              AS complete_sitting_without_responses,
+    COUNTIF(r.session_id IS NULL AND NOT s.is_complete)          AS info_incomplete_without_responses,
+    COUNTIF(s.is_complete AND r.n_responses < s.total_questions) AS complete_but_fewer_responses_than_total,
+    COUNTIF(r.n_distinct_questions > s.total_questions)          AS more_questions_than_total,
+    COUNTIF(r.max_question_number > s.total_questions)           AS question_number_above_total
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings` AS s
+  LEFT JOIN responses_per_session AS r ON r.session_id = s.session_id
+  LEFT JOIN pupils                AS p ON p.pupil_id   = s.pupil_id
+)
+UNPIVOT (n FOR check_name IN (
+  info_sittings, sitting_without_pupil, live_sitting_for_deleted_pupil,
+  complete_sitting_without_responses, info_incomplete_without_responses,
+  complete_but_fewer_responses_than_total, more_questions_than_total,
+  question_number_above_total
+));
+
+
+-- =============================================================================
+-- C. SEMANTICS
+-- =============================================================================
+
+-- C1. Categorical vocabularies. The sample already shows responses.session_type
+--     = 'MOCK_TEST' vs sittings.session_type = 'summative_assessment', and a
+--     subject (Non-Verbal Reasoning) that has no KS2 test.
+SELECT 'responses.session_type' AS column_name, session_type AS value, COUNT(*) AS n
+FROM `atom-analytics-candidates.de_raw.responses` GROUP BY 2
+UNION ALL
+SELECT 'sittings.session_type', session_type, COUNT(*)
+FROM `atom-analytics-candidates.de_raw.assessment_sittings` GROUP BY 2
+UNION ALL
+SELECT 'sittings.style', style, COUNT(*)
+FROM `atom-analytics-candidates.de_raw.assessment_sittings` GROUP BY 2
+UNION ALL
+SELECT 'sittings.year_group_at_sitting', CAST(year_group_at_sitting AS STRING), COUNT(*)
+FROM `atom-analytics-candidates.de_raw.assessment_sittings` GROUP BY 2
+UNION ALL
+SELECT 'sittings.total_questions', CAST(total_questions AS STRING), COUNT(*)
+FROM `atom-analytics-candidates.de_raw.assessment_sittings` GROUP BY 2
+UNION ALL
+SELECT 'hierarchy.subject_name', subject_name, COUNT(*)
+FROM `atom-analytics-candidates.de_raw.course_hierarchy` GROUP BY 2
+ORDER BY column_name, n DESC;
+
+
+-- C2. How the two session_type vocabularies line up. Are MOCK_TEST responses
+--     sessions that exist in assessment_sittings, or a separate product?
+SELECT
+  r.session_type               AS responses_session_type,
+  s.session_type               AS sittings_session_type,
+  s.style,
+  s.session_id IS NOT NULL     AS has_sitting,
+  COUNT(DISTINCT r.session_id) AS n_sessions,
+  COUNT(*)                     AS n_responses
+FROM `atom-analytics-candidates.de_raw.responses` AS r
+LEFT JOIN `atom-analytics-candidates.de_raw.assessment_sittings` AS s
+  ON s.session_id = r.session_id
+GROUP BY 1, 2, 3, 4
+ORDER BY n_responses DESC;
+
+
+-- C3. How many subjects does one sitting cover? Decides the grain of the
+--     intermediate model (sitting, or sitting x subject).
+SELECT n_subjects, COUNT(*) AS n_sessions
+FROM (
+  SELECT r.session_id, COUNT(DISTINCT h.subject_id) AS n_subjects
+  FROM `atom-analytics-candidates.de_raw.responses` AS r
+  JOIN `atom-analytics-candidates.de_raw.course_hierarchy` AS h
+    ON h.question_id = r.question_id
+  GROUP BY 1
+)
+GROUP BY 1
+ORDER BY 1;
+
+
+-- C4. Is an assessment_id a stable "paper"? Same length, same year group,
+--     same type/style across every sitting.
+SELECT
+  COUNT(*)                                     AS n_assessments,
+  COUNTIF(n_sittings = 1)                      AS info_sat_once,
+  COUNTIF(n_total_questions > 1)               AS length_varies,
+  COUNTIF(n_year_groups > 1)                   AS sat_by_several_year_groups,
+  COUNTIF(n_session_types > 1 OR n_styles > 1) AS type_or_style_varies
+FROM (
+  SELECT
+    assessment_id,
+    COUNT(*)                              AS n_sittings,
+    COUNT(DISTINCT total_questions)       AS n_total_questions,
+    COUNT(DISTINCT year_group_at_sitting) AS n_year_groups,
+    COUNT(DISTINCT session_type)          AS n_session_types,
+    COUNT(DISTINCT style)                 AS n_styles
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings`
+  GROUP BY 1
+);
+
+
+-- C5. Does style = 'fixed_question' mean every sitting gets the same questions?
+--     ratio = distinct questions ever served / paper length. 1.0 = truly fixed.
+--     If an adaptive style exists, % correct is not an ability measure there:
+--     adaptive tests push everyone towards a similar % by design.
+WITH per_assessment AS (
+  SELECT
+    s.assessment_id,
+    ANY_VALUE(s.style)            AS style,
+    MAX(s.total_questions)        AS total_questions,
+    COUNT(DISTINCT r.question_id) AS distinct_questions_served
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings` AS s
+  JOIN `atom-analytics-candidates.de_raw.responses` AS r
+    ON r.session_id = s.session_id
+  GROUP BY 1
+)
+SELECT
+  style,
+  COUNT(*)                                             AS n_assessments,
+  COUNTIF(distinct_questions_served = total_questions) AS exactly_fixed,
+  COUNTIF(distinct_questions_served > total_questions) AS pool_larger_than_paper,
+  APPROX_QUANTILES(
+    ROUND(SAFE_DIVIDE(distinct_questions_served, total_questions), 2), 4
+  )                                                    AS ratio_quartiles
+FROM per_assessment
+GROUP BY 1;
+
+
+-- C6. Is year_group_at_sitting consistent per pupil over time? It's the only
+--     place we learn a pupil's year group (pupils has no such column).
+--     Academic year is labelled by its starting calendar year: Sep 2025-Aug 2026 = 2025.
+WITH
+sittings AS (
+  SELECT
+    pupil_id,
+    session_id,
+    started_at,
+    year_group_at_sitting AS year_group,
+    EXTRACT(YEAR FROM DATE_SUB(DATE(started_at, 'Europe/London'), INTERVAL 8 MONTH)) AS academic_year
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings`
+  WHERE NOT is_deleted
+),
+with_previous AS (
+  SELECT
+    *,
+    LAG(year_group)    OVER w AS prev_year_group,
+    LAG(academic_year) OVER w AS prev_academic_year
+  FROM sittings
+  WINDOW w AS (PARTITION BY pupil_id ORDER BY started_at, session_id)
+)
+SELECT
+  COUNT(DISTINCT pupil_id)                                                 AS n_pupils,
+  COUNT(DISTINCT academic_year)                                            AS n_academic_years,
+  COUNT(DISTINCT IF(year_group < prev_year_group, pupil_id, NULL))         AS pupils_year_group_goes_down,
+  COUNT(DISTINCT IF(year_group > prev_year_group + 1, pupil_id, NULL))     AS pupils_skip_a_year,
+  COUNT(DISTINCT IF(year_group != prev_year_group
+                    AND academic_year = prev_academic_year, pupil_id, NULL)) AS pupils_change_mid_year
+FROM with_previous;
+
+
+-- C7. Retakes: the same pupil sitting the same paper more than once.
+--     A second attempt at a fixed paper has seen the questions.
+SELECT n_usable_sittings, COUNT(*) AS n_pupil_assessments
+FROM (
+  SELECT pupil_id, assessment_id, COUNTIF(is_complete AND NOT is_deleted) AS n_usable_sittings
+  FROM `atom-analytics-candidates.de_raw.assessment_sittings`
+  GROUP BY 1, 2
+)
+GROUP BY 1
+ORDER BY 1;
+
+
+-- =============================================================================
+-- D. SCORING INPUTS
+-- =============================================================================
+
+-- D1. Evidence per pupil per subject, from complete, non-deleted sittings.
+--     Sets the "enough evidence" threshold and sizes the no-evidence rows
+--     in the final every-pupil-every-subject table.
+WITH
+usable AS (
+  SELECT r.pupil_id, h.subject_name, r.session_id
+  FROM `atom-analytics-candidates.de_raw.responses` AS r
+  JOIN `atom-analytics-candidates.de_raw.assessment_sittings` AS s
+    ON s.session_id = r.session_id AND s.is_complete AND NOT s.is_deleted
+  JOIN (SELECT DISTINCT question_id, subject_name
+        FROM `atom-analytics-candidates.de_raw.course_hierarchy`) AS h
+    ON h.question_id = r.question_id
+),
+per_pupil_subject AS (
+  SELECT pupil_id, subject_name,
+         COUNT(*) AS n_responses, COUNT(DISTINCT session_id) AS n_sittings
+  FROM usable
+  GROUP BY 1, 2
+)
+SELECT
+  subject_name,
+  COUNT(*)                                     AS n_pupils_with_evidence,
+  APPROX_QUANTILES(n_responses, 10)[OFFSET(1)] AS p10_responses,
+  APPROX_QUANTILES(n_responses, 2)[OFFSET(1)]  AS median_responses,
+  APPROX_QUANTILES(n_responses, 10)[OFFSET(9)] AS p90_responses,
+  COUNTIF(n_sittings = 1)                      AS pupils_with_one_sitting,
+  COUNTIF(n_responses < 20)                    AS pupils_under_20_responses
+FROM per_pupil_subject
+GROUP BY 1
+UNION ALL
+SELECT '(live pupils with no usable responses)', COUNT(*), NULL, NULL, NULL, NULL, NULL
+FROM `atom-analytics-candidates.de_raw.pupils` AS p
+WHERE NOT p.is_deleted
+  AND NOT EXISTS (SELECT 1 FROM usable AS u WHERE u.pupil_id = p.pupil_id)
+ORDER BY 1;
+
+
+-- D2. What do percentages look like? Sitting-level % correct by subject,
+--     year group and session type.
+--     Yardstick from the 2026 KS2 tables: 100 (expected standard) sits at
+--     ~50% of marks in all three tests; 110 at ~78% (reading, GPS), ~85% (maths).
+--     If mean % here is ~75%, most pupils will land well above 100.
+WITH sitting_subject AS (
+  SELECT
+    r.session_id,
+    h.subject_name,
+    s.year_group_at_sitting,
+    s.session_type,
+    COUNT(*)                                     AS n_questions,
+    SAFE_DIVIDE(COUNTIF(r.is_correct), COUNT(*)) AS pct_correct
+  FROM `atom-analytics-candidates.de_raw.responses` AS r
+  JOIN `atom-analytics-candidates.de_raw.assessment_sittings` AS s
+    ON s.session_id = r.session_id
+  JOIN (SELECT DISTINCT question_id, subject_name
+        FROM `atom-analytics-candidates.de_raw.course_hierarchy`) AS h
+    ON h.question_id = r.question_id
+  WHERE s.is_complete AND NOT s.is_deleted
+  GROUP BY 1, 2, 3, 4
+)
+SELECT
+  subject_name,
+  year_group_at_sitting,
+  session_type,
+  COUNT(*)                                       AS n_sittings,
+  ROUND(AVG(n_questions), 1)                     AS avg_questions,
+  ROUND(AVG(pct_correct), 3)                     AS mean_pct,
+  APPROX_QUANTILES(ROUND(pct_correct, 2), 4)     AS pct_quartiles,
+  ROUND(COUNTIF(pct_correct >= 0.5) / COUNT(*), 3) AS share_at_or_above_50pct
+FROM sitting_subject
+GROUP BY 1, 2, 3
+ORDER BY 1, 2, 3;
+
+
+-- D3. Question facility (share correct). A question nobody, or everybody, gets
+--     right over 30+ attempts is worth a look: often a broken answer key.
+WITH per_question AS (
+  SELECT
+    question_id,
+    COUNT(*)                                     AS n_attempts,
+    SAFE_DIVIDE(COUNTIF(is_correct), COUNT(*))   AS facility
+  FROM `atom-analytics-candidates.de_raw.responses`
+  WHERE NOT is_no_attempt
+  GROUP BY 1
+  HAVING n_attempts >= 30
+)
+SELECT
+  h.subject_name,
+  COUNT(*)                   AS questions_30plus_attempts,
+  COUNTIF(q.facility = 0)    AS never_correct,
+  COUNTIF(q.facility = 1)    AS always_correct,
+  ROUND(AVG(q.facility), 3)  AS mean_facility
+FROM per_question AS q
+JOIN (SELECT DISTINCT question_id, subject_name
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`) AS h
+  ON h.question_id = q.question_id
+GROUP BY 1
+ORDER BY 1;
+
+
+-- D4. Response speed vs accuracy. If <=2s answers are right at roughly chance
+--     rate they're guesses. Default is to keep them (a guess is still an
+--     answer on a real paper) but the rate belongs in the README.
+SELECT
+  h.subject_name,
+  CASE
+    WHEN r.is_no_attempt       THEN '0: no attempt'
+    WHEN r.seconds_taken <= 2  THEN '1: <=2s'
+    WHEN r.seconds_taken <= 10 THEN '2: 3-10s'
+    WHEN r.seconds_taken <= 60 THEN '3: 11-60s'
+    ELSE                            '4: >60s'
+  END                                                    AS speed_band,
+  COUNT(*)                                               AS n_responses,
+  ROUND(SAFE_DIVIDE(COUNTIF(r.is_correct), COUNT(*)), 3) AS pct_correct
+FROM `atom-analytics-candidates.de_raw.responses` AS r
+JOIN (SELECT DISTINCT question_id, subject_name
+      FROM `atom-analytics-candidates.de_raw.course_hierarchy`) AS h
+  ON h.question_id = r.question_id
+GROUP BY 1, 2
+ORDER BY 1, 2;
