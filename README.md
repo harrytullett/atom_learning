@@ -78,7 +78,7 @@ I considered splitting analytics into several tables. For 63k rows and a two-hou
 
 ## AI usage
 
-I used AI for planning, the first round of EDA, coding help and checking the output. Details are in AI_USAGE.md doc!
+I used AI for planning, the first round of EDA from initial query ideas I mapped out, code PR reviews, and finally for writing the queries I mapped out for checking the output. Details are in AI_USAGE.md doc!
 
 ## What I'd do next
 
